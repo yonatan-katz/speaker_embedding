@@ -14,6 +14,7 @@ from speaker_embed import networks
 from database import tedlium
 from tacotron2.layers import TacotronSTFT
 
+
 SFT_CONFIG={    
     "sampling_rate": 16000,
     "filter_length": 400,
@@ -34,18 +35,19 @@ class EmbeddingNetClassifier(networks.EmbeddingNet):
     def forward(self, x): 
         x = self.logits(x)
         x = self.fc(x)
-        #return F.log_softmax(x)
-        return F.softmax(x)
+        return F.log_softmax(x)
+        #return F.softmax(x)
     
 
-def data_generator(data_base,chunk_length_in_sec,label_order_list):
+def data_generator(data_base,chunk_length_in_sec,label_order_list,batch_size):    
     stft = TacotronSTFT(**SFT_CONFIG)
     keys = data_base.get_db_keys()    
     times = data_base.get_db_wv_times(keys[0])
+    batch_x = []
+    batch_y = []
     while True:        
             for k in keys:                
-                label = np.array([[label_order_list.index(k)]]) 
-                y_tensor = torch.from_numpy(label).long()                
+                label = np.array([label_order_list.index(k)])                 
                 sampling_rate, speech = data_base.get_wav(keys[0],*times[0])
                 chunks = int(len(speech)/sampling_rate/chunk_length_in_sec)
                 audio_length = sampling_rate*chunk_length_in_sec
@@ -61,32 +63,46 @@ def data_generator(data_base,chunk_length_in_sec,label_order_list):
                         channel_mean = np.mean(mel_np[0,i,:])  
                         mel_np[0,i,:] = mel_np[0,i,:] - channel_mean
                     
-                    normalized_mel = torch.from_numpy(mel_np)
-                    yield normalized_mel.unsqueeze(1), Variable(y_tensor)
+                    #normalized_mel = torch.from_numpy(mel_np)
+                    batch_x.append(mel_np)
+                    batch_y.append(label)
+                    #yield normalized_mel.unsqueeze(1), Variable(y_tensor)
+                    if len(batch_x) >= batch_size:
+                        x = torch.from_numpy(np.array(batch_x))
+                        y = Variable(torch.from_numpy(np.concatenate(batch_y)).long())
+                        batch_x = []
+                        batch_y = []
+                        yield x,y
+                        
                     
     
 
 def main(): 
+    torch.cuda.init()
+    device = torch.cuda.current_device()    
+    torch.cuda.set_device(device)
+    batch_size = 64
     chunk_length_in_sec=3
-    learning_rate = 1e-3
+    learning_rate = 1e-2
     data_base = tedlium.TedLium(mode='train')
     label_order_list = sorted(data_base.get_db_keys())
     num_of_clusses = len(set(label_order_list))
     print('Tedium DB num of classes is:',num_of_clusses)
     G_data = data_generator(data_base=data_base,
         chunk_length_in_sec=chunk_length_in_sec,
-        label_order_list=label_order_list)    
+        label_order_list=label_order_list,
+        batch_size=batch_size)
     
-    embedding_net = EmbeddingNetClassifier(num_of_clusses=num_of_clusses)
-    optimizer = torch.optim.SGD(embedding_net.parameters(), 
-        lr=learning_rate, 
-        momentum=0.9)    
-    criterion = nn.NLLLoss()
+    embedding_net = EmbeddingNetClassifier(num_of_clusses=num_of_clusses).to('cuda:0')    
+    optimizer = torch.optim.Adam(embedding_net.parameters(), 
+        lr=learning_rate)
+    criterion = nn.NLLLoss()    
     
     batch_idx = 0        
     for batch_idx in range(1000):
         data,target = next(G_data)        
-        target = target.view(-1)
+        data = data.to('cuda:0')
+        target = target.view(-1).to('cuda:0')
         optimizer.zero_grad()
         net_out = embedding_net(data)        
         loss = criterion(net_out, target)
